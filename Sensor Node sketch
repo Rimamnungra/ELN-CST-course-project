@@ -1,0 +1,251 @@
+// ===================== Definitions =====================
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <time.h>
+
+// ===================== Wi-Fi Settings =====================
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
+
+// ===================== MQTT Settings =====================
+const char* MQTT_BROKER = "test.mosquitto.org";
+const int   MQTT_PORT = 1883;
+const char* MQTT_CLIENT_ID = "farmbot-sensor-node-01";
+const char* MQTT_TOPIC = "eln0008/telemetry/farmbot";
+const char* NODE_ID = "node1";
+
+// ===================== NTP Settings =====================
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+const long  GMT_OFFSET_SEC = 0;
+const int   DAYLIGHT_OFFSET_SEC = 0;
+
+// ===================== Sensor Pins =====================
+#define DHTPIN 5
+#define DHTTYPE DHT22
+#define LIGHT_PIN 34
+#define PH_PIN 35
+// ===================== Objects =====================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+
+// ===================== Global variables =====================
+const unsigned long PUBLISH_INTERVAL_MS = 5000;
+unsigned long lastPublish = 0;
+
+// ===================== Conversion Functions =====================
+float lightPercentFromRaw(float raw) {
+  return (raw / 4095.0) * 100.0;
+}
+
+float phFromRaw(float raw) {
+  float voltage = (raw / 4095.0) * 3.3;
+  float ph = (voltage / 3.3) * 14.0;
+  if (ph < 0) ph = 0;
+  if (ph > 14) ph = 14;
+  return ph;
+}
+
+// ===================== Wi-Fi Setup =====================
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ===================== MQTT Setup =====================
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT... ");
+
+    if (mqttClient.connect(MQTT_CLIENT_ID)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 2 seconds");
+      delay(2000);
+    }
+  }
+}
+
+// ===================== Time Setup =====================
+void syncTimeWithNTP() {
+  Serial.println("Configuring NTP...");
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+
+  struct tm timeinfo;
+  int retries = 0;
+  const int maxRetries = 30;
+
+  while (!getLocalTime(&timeinfo) && retries < maxRetries) {
+    Serial.print(".");
+    delay(500);
+    retries++;
+  }
+
+  Serial.println();
+
+  if (retries >= maxRetries) {
+    Serial.println("Failed to get time from NTP");
+  } else {
+    Serial.println("Time synchronized");
+  }
+}
+
+bool getTimestamp(char* buffer, size_t len) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return false;
+  }
+
+  // UTC ISO 8601 style: 2026-11-17 T 21:05:30Z
+  strftime(buffer, len, "%Y-%m-%d T %H:%M:%SZ", &timeinfo);
+  return true;
+}
+
+// ===================== Publish Telemetry =====================
+
+void publishTelemetry() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  float light = lightPercentFromRaw(analogRead(LIGHT_PIN));
+  float ph = phFromRaw(analogRead(PH_PIN));
+
+  char timestamp[25];
+  bool hasTime = getTimestamp(timestamp, sizeof(timestamp));
+
+  char payload[220];
+
+ if (isnan(temperature) || isnan(humidity)) {
+    if (hasTime) {
+      snprintf(payload, sizeof(payload),
+        "{\"node_id\":\"%s\",\"timestamp\":\"%s\",\"temperature\":null,\"humidity\":null,\"light\":%.2f,\"ph\":%.2f}",
+        NODE_ID, timestamp, light, ph);
+    } else {
+      snprintf(payload, sizeof(payload),
+        "{\"node_id\":\"%s\",\"timestamp\":\"unsynced\",\"temperature\":null,\"humidity\":null,\"light\":%.2f,\"ph\":%.2f}",
+        NODE_ID, light, ph);
+    }
+  } else {
+    if (hasTime) {
+      snprintf(payload, sizeof(payload),
+        "{\"node_id\":\"%s\",\"timestamp\":\"%s\",\"temperature\":%.2f,\"humidity\":%.2f,\"light\":%.2f,\"ph\":%.2f}",
+        NODE_ID, timestamp, temperature, humidity, light, ph);
+    } else {
+      snprintf(payload, sizeof(payload),
+        "{\"node_id\":\"%s\",\"timestamp\":\"unsynced\",\"temperature\":%.2f,\"humidity\":%.2f,\"light\":%.2f,\"ph\":%.2f}",
+        NODE_ID, temperature, humidity, light, ph);
+    }
+  }
+
+  printTelemetryToSerial(
+    hasTime ? timestamp : "unsynced",
+    temperature,
+    humidity,
+    light,
+    ph
+  );
+  bool ok = mqttClient.publish(MQTT_TOPIC, payload);
+
+  if (ok) {
+    Serial.println("Publish OK");
+  } else {
+    Serial.println("Publish failed");
+  }
+}
+
+// ===================== Print Telemetry to Serial =====================
+
+void printTelemetryToSerial(
+  const char* timestamp,
+  float temperature,
+  float humidity,
+  float light,
+  float ph
+) {
+  Serial.println("----- Telemetry -----");
+  Serial.print("Node ID      : ");
+  Serial.println(NODE_ID);
+
+  Serial.print("Timestamp    : ");
+  Serial.println(timestamp);
+
+  Serial.print("Temperature  : ");
+  if (isnan(temperature)) {
+    Serial.println("null");
+  } else {
+    Serial.print(temperature, 2);
+    Serial.println(" C");
+  }
+
+  Serial.print("Humidity     : ");
+  if (isnan(humidity)) {
+    Serial.println("null");
+  } else {
+    Serial.print(humidity, 2);
+    Serial.println(" %");
+  }
+
+  Serial.print("Light        : ");
+  Serial.print(light, 2);
+  Serial.println(" %");
+
+  Serial.print("pH           : ");
+  Serial.println(ph, 2);
+
+  Serial.println("---------------------");
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("Booting Smart Farm Node...");
+  Serial.print("Node ID: ");
+  Serial.println(NODE_ID);
+
+  analogReadResolution(12);
+  
+  dht.begin();
+  connectWiFi();
+  syncTimeWithNTP();
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  connectMQTT();
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    syncTimeWithNTP();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+
+  mqttClient.loop();
+
+  unsigned long now = millis();
+  if (now - lastPublish >= PUBLISH_INTERVAL_MS) {
+    lastPublish = now;
+    publishTelemetry();
+  }
+}
