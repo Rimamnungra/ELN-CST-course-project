@@ -1,0 +1,646 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// ===================== Wi-Fi Settings =====================
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASSWORD = "";
+
+// ===================== MQTT Settings =====================
+const char* MQTT_BROKER = "test.mosquitto.org";
+const int MQTT_PORT = 1883;
+const char* MQTT_CLIENT_ID = "farmbot-gateway-node";
+
+const char* SUB_TOPIC = "eln0008/telemetry/farmbot";
+const char* SUMMARY_TOPIC = "farm/gateway/summary";
+const char* IRRIGATION_TOPIC = "farm/gateway/irrigation/status";
+
+// ===================== Objects =====================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// ===================== Pin Definitions =====================
+#define RELAY_PIN 5
+#define REFILL_PIN 18
+#define RESERVOIR_LEVEL_PIN 34
+
+// ===================== Irrigation thresholds =====================
+const float IRRIGATION_START_TEMP = 30.0;
+const float IRRIGATION_STOP_TEMP = 25.0;
+const float IRRIGATION_START_HUMIDITY = 45.0;
+
+// Latched irrigation state
+bool irrigationLatched = false;
+
+// ===================== Timing =====================
+const unsigned long SUMMARY_INTERVAL_MS = 5000;
+unsigned long lastSummary = 0;
+
+// ===================== Timestamp Validation =====================
+const int64_t MAX_READING_AGE_SECONDS = 30;
+const int64_t MAX_FUTURE_SECONDS = 5;
+
+// NTP synchronization status
+bool clockSynchronized = false;
+
+// ===================== Node Data Structure =====================
+struct NodeReading {
+  String nodeId;
+  String timestamp;
+
+  int64_t timestampEpoch;
+
+  float temperature;
+  float humidity;
+  float light;
+  float ph;
+
+  bool valid;
+  unsigned long lastUpdate;
+};
+
+const int MAX_NODES = 3;
+NodeReading nodes[MAX_NODES];
+
+// ===================== UTILITY FUNCTIONS =====================
+void initNodes() {
+  for (int i = 0; i < MAX_NODES; i++) {
+    nodes[i].nodeId = "";
+    nodes[i].timestamp = "";
+    nodes[i].timestampEpoch = 0;
+    nodes[i].temperature = 0;
+    nodes[i].humidity = 0;
+    nodes[i].light = 0;
+    nodes[i].ph = 0;
+    nodes[i].valid = false;
+    nodes[i].lastUpdate = 0;
+  }
+}
+
+int findNodeIndex(const String& nodeId) {
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodes[i].valid && nodes[i].nodeId == nodeId) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int getFreeNodeIndex() {
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (!nodes[i].valid) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+bool computeAverages(
+  float &avgTemp, 
+  float &avgHumidity, 
+  float &avgLight, 
+  float &avgPh, 
+  int &count) {
+
+  float sumTemp = 0;
+  float sumHumidity = 0;
+  float sumLight = 0;
+  float sumPh = 0;
+  count = 0;
+
+  int64_t currentEpoch = (int64_t)time(nullptr);
+
+    for (int i = 0; i < MAX_NODES; i++) {
+
+        // Invalidate expired readings.
+        if (nodes[i].valid &&
+            clockSynchronized &&
+            currentEpoch - nodes[i].timestampEpoch >
+                MAX_READING_AGE_SECONDS) {
+
+            nodes[i].valid = false;
+
+            Serial.print("Node expired: ");
+            Serial.println(nodes[i].nodeId);
+        }
+
+        // Include only valid readings.
+        if (nodes[i].valid) {
+
+            sumTemp += nodes[i].temperature;
+            sumHumidity += nodes[i].humidity;
+            sumLight += nodes[i].light;
+            sumPh += nodes[i].ph;
+
+            count++;
+        }
+    }
+
+    // No valid readings available.
+    if (count == 0) {
+        return false;
+    }
+
+    // Calculate averages.
+    avgTemp = sumTemp / count;
+    avgHumidity = sumHumidity / count;
+    avgLight = sumLight / count;
+    avgPh = sumPh / count;
+
+    return true;
+}
+
+// Convert a calendar date into days since 1970-01-01.
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+
+  year -= (month <= 2);
+
+  const int era = (year >= 0 ? year : year - 399) / 400;
+
+  const unsigned yearOfEra = year - era * 400;
+
+  const unsigned dayOfYear =
+      (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5
+      + day - 1;
+
+  const unsigned dayOfEra =
+      yearOfEra * 365
+      + yearOfEra / 4
+      - yearOfEra / 100
+      + dayOfYear;
+
+  return (int64_t)era * 146097 + dayOfEra - 719468;
+}
+
+
+// Parse ISO 8601 timestamps
+bool parseIso8601(const String& timestamp, int64_t& epoch) {
+
+  if (timestamp.length() < 20) {
+    return false;
+  }
+
+  int year, month, day;
+  int hour, minute, second;
+
+  if (sscanf(timestamp.c_str(),
+             "%4d-%2d-%2dT%2d:%2d:%2d",
+             &year, &month, &day,
+             &hour, &minute, &second) != 6) {
+    return false;
+  }
+
+  // Validate date and time fields.
+  if (year < 1970 || year > 9999 ||
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      second < 0 || second > 59) {
+    return false;
+  }
+
+  // Validate actual number of days in the month.
+  const int monthDays[] = {
+    31, 28, 31, 30, 31, 30,
+    31, 31, 30, 31, 30, 31
+  };
+
+  int maxDay = monthDays[month - 1];
+
+  bool leapYear =
+      (year % 4 == 0 && year % 100 != 0) ||
+      (year % 400 == 0);
+
+  if (month == 2 && leapYear) {
+    maxDay = 29;
+  }
+
+  if (day > maxDay) {
+    return false;
+  }
+
+  // Start parsing timezone after seconds.
+  const char* suffix = timestamp.c_str() + 19;
+
+  // Skip optional fractional seconds.
+  if (*suffix == '.') {
+    suffix++;
+
+    if (*suffix < '0' || *suffix > '9') {
+      return false;
+    }
+
+    while (*suffix >= '0' && *suffix <= '9') {
+      suffix++;
+    }
+  }
+
+  int offsetMinutes = 0;
+
+  if (*suffix == 'Z' && *(suffix + 1) == '\0') {
+
+    offsetMinutes = 0;
+
+  } else if (*suffix == '+' || *suffix == '-') {
+
+    int offsetHours;
+    int offsetMins;
+
+    char sign = *suffix;
+
+    if (strlen(suffix) != 6 ||
+        sscanf(suffix + 1, "%2d:%2d",
+               &offsetHours, &offsetMins) != 2) {
+      return false;
+    }
+
+    if (offsetHours > 14 ||
+        offsetMins > 59 ||
+        (offsetHours == 14 && offsetMins != 0)) {
+      return false;
+    }
+
+    offsetMinutes = offsetHours * 60 + offsetMins;
+
+    if (sign == '-') {
+      offsetMinutes = -offsetMinutes;
+    }
+
+  } else {
+    return false;
+  }
+
+  int64_t days = daysFromCivil(year, month, day);
+
+  epoch =
+      days * 86400
+      + hour * 3600
+      + minute * 60
+      + second
+      - (int64_t)offsetMinutes * 60;
+
+  return true;
+}
+
+
+// Validate timestamp against gateway time.
+bool validateTimestamp(
+    const String& timestamp,
+    int64_t& messageEpoch
+) {
+
+  if (!clockSynchronized) {
+    Serial.println("Rejected: Gateway clock not synchronized");
+    return false;
+  }
+
+  if (!parseIso8601(timestamp, messageEpoch)) {
+    Serial.println("Rejected: Invalid ISO 8601 timestamp");
+    return false;
+  }
+
+  int64_t currentEpoch = (int64_t)time(nullptr);
+
+  int64_t age = currentEpoch - messageEpoch;
+
+  if (age > MAX_READING_AGE_SECONDS) {
+    Serial.print("Rejected: Stale reading, age = ");
+    Serial.print((long long)age);
+    Serial.println(" seconds");
+    return false;
+  }
+
+  if (age < -MAX_FUTURE_SECONDS) {
+    Serial.print("Rejected: Timestamp is in the future by ");
+    Serial.print((long long)(-age));
+    Serial.println(" seconds");
+    return false;
+  }
+
+  return true;
+}
+
+//------------ IRRIGATION PUBLISH ---------------------
+void publishIrrigationStatus(bool irrigationOn, float avgTemp, float avgHumidity) {
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+    "{\"irrigation\":\"%s\",\"avg_temperature\":%.2f,\"avg_humidity\":%.2f}",
+    irrigationOn ? "on" : "off",
+    avgTemp,
+    avgHumidity
+  );
+
+  mqttClient.publish(IRRIGATION_TOPIC, payload);
+
+  Serial.println("Published irrigation status: ");
+  Serial.print("Irrigation Status: ");
+  Serial.println(irrigationOn? "ON" : "OFF");
+  Serial.print("Average Temperature: ");
+  Serial.println(avgTemp);
+  Serial.print("Average Humidity: ");
+  Serial.println(avgHumidity);
+  Serial.println("-----------------------------------");
+  Serial.println("-----------------------------------");
+}
+
+//----------------- IRRIGATION LOGIC -----------------------
+void applyIrrigationLogic(float avgTemp, float avgHumidity) {
+
+  // Start irrigation
+  if (!irrigationLatched &&
+      avgTemp > IRRIGATION_START_TEMP &&
+      avgHumidity < IRRIGATION_START_HUMIDITY) {
+
+    irrigationLatched = true;
+    Serial.println("Irrigation latch SET");
+  }
+
+  // Stop irrigation
+  else if (irrigationLatched &&
+           avgTemp <= IRRIGATION_STOP_TEMP) {
+
+    irrigationLatched = false;
+    Serial.println("Irrigation latch RESET");
+  }
+
+  // Apply the latched state
+  digitalWrite(RELAY_PIN, irrigationLatched ? HIGH : LOW);
+
+  publishIrrigationStatus(irrigationLatched, avgTemp, avgHumidity);
+}
+
+void publishSummary() {
+  float avgTemp, avgHumidity, avgLight, avgPh;
+  int count;
+
+  if (!computeAverages(avgTemp, avgHumidity, avgLight, avgPh, count)) {
+    Serial.println("No valid node data yet");
+    return;
+  }
+
+  char payload[220];
+  snprintf(payload, sizeof(payload),
+           "{\"node_count\":%d,\"avg_temperature\":%.2f,\"avg_humidity\":%.2f,\"avg_light\":%.2f,\"avg_ph\":%.2f}",
+           count, avgTemp, avgHumidity, avgLight, avgPh);
+
+  mqttClient.publish(SUMMARY_TOPIC, payload);
+
+  Serial.println("Gateway summary published: ");
+
+  applyIrrigationLogic(avgTemp, avgHumidity);
+}
+
+void storeNodeReading(
+  const String& nodeId, 
+  const String& timestamp,
+  int64_t timestampEpoch, 
+  float temperature, 
+  float humidity, 
+  float light, 
+  float ph) {
+  
+  int index = findNodeIndex(nodeId);
+  if (index == -1) {
+    index = getFreeNodeIndex();
+  }
+
+  if (index == -1) {
+    Serial.println("No free slot for new node");
+    return;
+  }
+
+  nodes[index].nodeId = nodeId;
+  nodes[index].timestamp = timestamp;
+  nodes[index].timestampEpoch = timestampEpoch;
+  nodes[index].temperature = temperature;
+  nodes[index].humidity = humidity;
+  nodes[index].light = light;
+  nodes[index].ph = ph;
+  nodes[index].valid = true;
+  nodes[index].lastUpdate = millis();
+
+  Serial.println("----- Node Updated -----");
+  Serial.print("Node ID      : ");
+  Serial.println(nodeId);
+  Serial.print("Timestamp    : ");
+  Serial.println(timestamp);
+  Serial.print("Temperature  : ");
+  Serial.println(temperature, 2);
+  Serial.print("Humidity     : ");
+  Serial.println(humidity, 2);
+  Serial.print("Light        : ");
+  Serial.println(light, 2);
+  Serial.print("pH           : ");
+  Serial.println(ph, 2);
+  Serial.println("------------------------");
+}
+
+// ===================== MQTT Callback =====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+
+  Serial.print("Message arrived on topic: ");
+  Serial.println(topic);
+
+  char jsonBuffer[256];
+
+  if (length >= sizeof(jsonBuffer)) {
+    Serial.println("Payload too large");
+    return;
+  }
+
+  memcpy(jsonBuffer, payload, length);
+  jsonBuffer[length] = '\0';
+
+  Serial.print("Payload: ");
+  Serial.println(jsonBuffer);
+
+  StaticJsonDocument<256> doc;
+
+  DeserializationError error =
+      deserializeJson(doc, jsonBuffer);
+
+  if (error) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  if (!doc.containsKey("node_id") ||
+      !doc.containsKey("timestamp")) {
+
+    Serial.println("Missing node_id or timestamp");
+    return;
+  }
+
+  if (doc["temperature"].isNull() ||
+      doc["humidity"].isNull()) {
+
+    Serial.println("Temperature or humidity is null");
+    return;
+  }
+
+  String nodeId = doc["node_id"].as<String>();
+  String timestamp = doc["timestamp"].as<String>();
+
+  float temperature = doc["temperature"];
+  float humidity = doc["humidity"];
+  float light = doc["light"] | 0.0f;
+  float ph = doc["ph"] | 0.0f;
+
+  // Step 1: Validate timestamp format and age.
+  int64_t messageEpoch;
+
+  if (!validateTimestamp(timestamp, messageEpoch)) {
+    Serial.println("Node reading discarded");
+    return;
+  }
+
+  // Step 2: Reject readings older than the last accepted
+  // reading from the same node.
+  int existingIndex = findNodeIndex(nodeId);
+
+  if (existingIndex != -1 &&
+      messageEpoch <= nodes[existingIndex].timestampEpoch) {
+
+    Serial.println("Rejected: Older or duplicate node reading");
+    return;
+  }
+
+  // Step 3: Store the valid reading.
+  storeNodeReading(
+      nodeId,
+      timestamp,
+      messageEpoch,
+      temperature,
+      humidity,
+      light,
+      ph
+  );
+
+  // Step 4: Recalculate averages and evaluate irrigation.
+  float avgTemp, avgHumidity, avgLight, avgPh;
+  int count;
+
+  if (computeAverages(
+          avgTemp, avgHumidity,
+          avgLight, avgPh, count)) {
+
+    applyIrrigationLogic(avgTemp, avgHumidity);
+  }
+}
+
+// ===================== Wi-Fi =====================
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ===================== MQTT =====================
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT... ");
+
+    if (mqttClient.connect(MQTT_CLIENT_ID)) {
+      Serial.println("connected");
+      mqttClient.subscribe(SUB_TOPIC);
+      Serial.print("Subscribed to: ");
+      Serial.println(SUB_TOPIC);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 2 seconds");
+      delay(2000);
+    }
+  }
+}
+
+// ===================== SYNCHRONIZE CLOCK =====================
+void synchronizeClock() {
+
+  Serial.println("Synchronizing gateway clock...");
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  const unsigned long timeout = 15000;
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+
+    time_t now = time(nullptr);
+
+    if (now > 1700000000) {
+      clockSynchronized = true;
+
+      Serial.println("Gateway clock synchronized");
+      Serial.print("Unix time: ");
+      Serial.println((long long)now);
+
+      return;
+    }
+
+    delay(500);
+    Serial.print(".");
+  }
+
+  clockSynchronized = false;
+
+  Serial.println();
+  Serial.println("WARNING: NTP synchronization failed");
+  Serial.println("Timestamp validation will reject incoming readings");
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("Smart Farm Gateway Node");
+  Serial.println("Aggregation + Irrigation Control");
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  pinMode(REFILL_PIN, OUTPUT);
+  digitalWrite(REFILL_PIN, LOW);
+
+  pinMode(RESERVOIR_LEVEL_PIN, INPUT);
+
+  initNodes();
+
+  connectWiFi();
+  synchronizeClock();
+
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  connectMQTT();
+}
+
+// ===================== Loop =====================
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+
+  mqttClient.loop();
+
+  unsigned long now = millis();
+  if (now - lastSummary >= SUMMARY_INTERVAL_MS) {
+    lastSummary = now;
+    publishSummary();
+  }
+}
