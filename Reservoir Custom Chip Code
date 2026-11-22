@@ -1,0 +1,802 @@
+
+#include "wokwi-api.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+// ============================================================
+// DISPLAY CONFIGURATION
+// ============================================================
+
+// Logical design dimensions.
+// All drawing coordinates below use this 160 x 220 layout.
+#define BASE_WIDTH  160
+#define BASE_HEIGHT 220
+
+// Actual Wokwi framebuffer/display dimensions.
+// Keep these synchronized with reservoir.chip.json.
+#define DISPLAY_WIDTH  480
+#define DISPLAY_HEIGHT 660
+
+// Maximum framebuffer allocation.
+// Must be at least as large as DISPLAY_WIDTH x DISPLAY_HEIGHT.
+#define MAX_DISPLAY_WIDTH  480
+#define MAX_DISPLAY_HEIGHT 660
+
+// ============================================================
+// RESERVOIR CONFIGURATION
+// ============================================================
+
+#define TANK_CAPACITY       1000.0f
+#define INITIAL_VOLUME       800.0f
+
+#define IRRIGATION_RATE       60.0f
+#define REFILL_RATE          120.0f
+
+#define UPDATE_INTERVAL_US  50000
+
+#define LEVEL_MAX_VOLTAGE      3.3f
+
+// ============================================================
+// COLOURS
+// ============================================================
+
+#define COLOR(r,g,b,a) \
+    ((uint32_t)(r) | ((uint32_t)(g) << 8) | \
+    ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24))
+
+#define BG_COLOR        COLOR(12, 20, 32, 255)
+#define HEADER_COLOR    COLOR(20, 32, 48, 255)
+
+#define FRAME_DARK      COLOR(55, 70, 85, 255)
+#define FRAME_MID       COLOR(115, 135, 150, 255)
+#define FRAME_LIGHT     COLOR(190, 205, 215, 255)
+
+#define TANK_BG         COLOR(15, 28, 42, 255)
+
+#define WATER_TOP       COLOR(75, 205, 255, 255)
+#define WATER_MID       COLOR(20, 135, 220, 255)
+#define WATER_BOTTOM    COLOR(5, 65, 155, 255)
+#define WATER_HIGHLIGHT COLOR(175, 240, 255, 255)
+
+#define WHITE           COLOR(245, 250, 255, 255)
+#define GREY            COLOR(145, 160, 175, 255)
+
+#define GREEN           COLOR(45, 220, 115, 255)
+#define RED             COLOR(245, 75, 75, 255)
+#define PANEL_COLOR     COLOR(27, 42, 58, 255)
+
+// ============================================================
+// CHIP STATE
+// ============================================================
+
+typedef struct {
+    pin_t irrigation_pin;
+    pin_t refill_pin;
+    pin_t level_pin;
+
+    buffer_t framebuffer;
+    timer_t timer;
+
+    uint32_t width;
+    uint32_t height;
+
+    float volume;
+    float wave_phase;
+
+    uint64_t last_update;
+} chip_state_t;
+
+// ============================================================
+// FRAMEBUFFER AND SCALING STATE
+// ============================================================
+
+static uint32_t pixels[
+    MAX_DISPLAY_WIDTH * MAX_DISPLAY_HEIGHT
+];
+
+static float scale_x_factor = 1.0f;
+static float scale_y_factor = 1.0f;
+
+static uint32_t render_width = BASE_WIDTH;
+static uint32_t render_height = BASE_HEIGHT;
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+static void draw_pixel(int x, int y, uint32_t color);
+
+static void draw_rect(
+    int x1, int y1, int x2, int y2,
+    uint32_t color
+);
+
+static void draw_line(
+    int x1, int y1, int x2, int y2,
+    uint32_t color
+);
+
+static void draw_text_scaled(
+    int x, int y,
+    const char *text,
+    uint32_t color,
+    int scale
+);
+
+static void draw_reservoir(chip_state_t *chip);
+
+static void update_reservoir(chip_state_t *chip);
+
+static void timer_callback(void *user_data);
+
+// ============================================================
+// COORDINATE SCALING
+// ============================================================
+
+static int scaled_x(int x) {
+    return (int)(x * scale_x_factor + 0.5f);
+}
+
+static int scaled_y(int y) {
+    return (int)(y * scale_y_factor + 0.5f);
+}
+
+// Low-level pixel writer.
+// Coordinates are actual display coordinates.
+static void put_pixel(
+    int x, int y,
+    uint32_t color
+) {
+    if (x < 0 || x >= (int)render_width ||
+        y < 0 || y >= (int)render_height) {
+        return;
+    }
+
+    pixels[y * render_width + x] = color;
+}
+
+// High-level pixel writer.
+// Coordinates use the reference design.
+static void draw_pixel(
+    int x, int y,
+    uint32_t color
+) {
+    put_pixel(
+        scaled_x(x),
+        scaled_y(y),
+        color
+    );
+}
+
+// ============================================================
+// RECTANGLES
+// ============================================================
+
+static void draw_rect(
+    int x1, int y1,
+    int x2, int y2,
+    uint32_t color
+) {
+    if (x1 > x2) {
+        int temp = x1;
+        x1 = x2;
+        x2 = temp;
+    }
+
+    if (y1 > y2) {
+        int temp = y1;
+        y1 = y2;
+        y2 = temp;
+    }
+
+    int sx1 = scaled_x(x1);
+    int sy1 = scaled_y(y1);
+    int sx2 = scaled_x(x2);
+    int sy2 = scaled_y(y2);
+
+    for (int y = sy1; y <= sy2; y++) {
+        for (int x = sx1; x <= sx2; x++) {
+            put_pixel(x, y, color);
+        }
+    }
+}
+
+// ============================================================
+// LINES
+// ============================================================
+
+static void draw_line(
+    int x1, int y1,
+    int x2, int y2,
+    uint32_t color
+) {
+    int dx = abs(x2 - x1);
+    int dy = abs(y2 - y1);
+
+    int sx = (x1 < x2) ? 1 : -1;
+    int sy = (y1 < y2) ? 1 : -1;
+
+    int err = dx - dy;
+
+    while (true) {
+        draw_pixel(x1, y1, color);
+
+        if (x1 == x2 && y1 == y2) {
+            break;
+        }
+
+        int e2 = 2 * err;
+
+        if (e2 > -dy) {
+            err -= dy;
+            x1 += sx;
+        }
+
+        if (e2 < dx) {
+            err += dx;
+            y1 += sy;
+        }
+    }
+}
+
+// ============================================================
+// FONT
+// ============================================================
+
+static const uint8_t *get_glyph(char c) {
+
+    static const uint8_t blank[5] = {
+        0, 0, 0, 0, 0
+    };
+
+    static const uint8_t digits[10][5] = {
+        {7,5,5,5,7},
+        {2,6,2,2,7},
+        {7,1,7,4,7},
+        {7,1,7,1,7},
+        {5,5,7,1,1},
+        {7,4,7,1,7},
+        {7,4,7,5,7},
+        {7,1,1,1,1},
+        {7,5,7,5,7},
+        {7,5,7,1,7}
+    };
+
+    static const uint8_t letters[26][5] = {
+        {2,5,7,5,5}, // A
+        {6,5,6,5,6}, // B
+        {3,4,4,4,3}, // C
+        {6,5,5,5,6}, // D
+        {7,4,6,4,7}, // E
+        {7,4,6,4,4}, // F
+        {3,4,5,5,3}, // G
+        {5,5,7,5,5}, // H
+        {7,2,2,2,7}, // I
+        {1,1,1,5,7}, // J
+        {5,5,6,5,5}, // K
+        {4,4,4,4,7}, // L
+        {5,7,7,5,5}, // M
+        {5,7,7,7,5}, // N
+        {7,5,5,5,7}, // O
+        {6,5,6,4,4}, // P
+        {7,5,5,7,1}, // Q
+        {6,5,6,5,5}, // R
+        {3,4,7,1,6}, // S
+        {7,2,2,2,2}, // T
+        {5,5,5,5,7}, // U
+        {5,5,5,5,2}, // V
+        {5,5,7,7,5}, // W
+        {5,5,2,5,5}, // X
+        {5,5,2,2,2}, // Y
+        {7,1,2,4,7}  // Z
+    };
+
+    if (c >= '0' && c <= '9') {
+        return digits[c - '0'];
+    }
+
+    if (c >= 'A' && c <= 'Z') {
+        return letters[c - 'A'];
+    }
+
+    return blank;
+}
+
+// ============================================================
+// SCALABLE TEXT
+// ============================================================
+
+static void draw_text_scaled(
+    int x, int y,
+    const char *text,
+    uint32_t color,
+    int scale
+) {
+    while (*text) {
+
+        const uint8_t *glyph = get_glyph(*text);
+
+        for (int row = 0; row < 5; row++) {
+            for (int col = 0; col < 3; col++) {
+
+                if (glyph[row] & (1 << (2 - col))) {
+
+                    draw_rect(
+                        x + col * scale,
+                        y + row * scale,
+                        x + col * scale + scale - 1,
+                        y + row * scale + scale - 1,
+                        color
+                    );
+                }
+            }
+        }
+
+        x += 4 * scale;
+        text++;
+    }
+}
+
+// ============================================================
+// HEADER AND VOLUME
+// ============================================================
+
+static void draw_header(chip_state_t *chip) {
+
+    draw_rect(
+        0, 0,
+        BASE_WIDTH - 1, 22,
+        HEADER_COLOR
+    );
+
+    draw_text_scaled(
+        43, 6,
+        "RESERVOIR",
+        WHITE,
+        2
+    );
+
+    draw_line(
+        8, 22,
+        151, 22,
+        FRAME_MID
+    );
+
+    char volume_text[16];
+
+    snprintf(
+        volume_text,
+        sizeof(volume_text),
+        "%dL",
+        (int)(chip->volume + 0.5f)
+    );
+
+    int length = 0;
+
+    while (volume_text[length] != '\0') {
+        length++;
+    }
+
+    int text_width = length * 12;
+
+    int x = (BASE_WIDTH - text_width) / 2;
+
+    draw_text_scaled(
+        x, 31,
+        volume_text,
+        WHITE,
+        3
+    );
+}
+
+// ============================================================
+// TANK FRAME
+// ============================================================
+
+static void draw_tank_frame(void) {
+
+    draw_rect(
+        19, 66, 134, 184,
+        COLOR(5, 10, 18, 255)
+    );
+
+    draw_rect(
+        21, 68, 130, 181,
+        FRAME_DARK
+    );
+
+    draw_rect(
+        23, 70, 128, 179,
+        FRAME_MID
+    );
+
+    draw_rect(
+        26, 73, 125, 176,
+        COLOR(65, 90, 110, 255)
+    );
+
+    draw_rect(
+        29, 76, 122, 173,
+        TANK_BG
+    );
+
+    draw_line(24, 70, 127, 70, FRAME_LIGHT);
+    draw_line(24, 70, 24, 178, FRAME_LIGHT);
+
+    draw_line(128, 71, 128, 178, FRAME_DARK);
+    draw_line(24, 179, 128, 179, FRAME_DARK);
+
+    draw_rect(37, 182, 51, 187, FRAME_MID);
+    draw_rect(100, 182, 114, 187, FRAME_MID);
+
+    draw_line(37, 182, 51, 182, FRAME_LIGHT);
+    draw_line(100, 182, 114, 182, FRAME_LIGHT);
+}
+
+// ============================================================
+// WATER
+// ============================================================
+
+static void draw_water(chip_state_t *chip) {
+
+    float percentage =
+        chip->volume / TANK_CAPACITY;
+
+    if (percentage < 0.0f) percentage = 0.0f;
+    if (percentage > 1.0f) percentage = 1.0f;
+
+    const int left = 29;
+    const int right = 122;
+    const int top = 77;
+    const int bottom = 172;
+
+    int tank_height = bottom - top;
+
+    int surface_y =
+        bottom - (int)(percentage * tank_height);
+
+    if (percentage <= 0.0f) {
+        return;
+    }
+
+    for (int y = surface_y; y <= bottom; y++) {
+
+        float depth =
+            (float)(y - surface_y) /
+            (float)(bottom - surface_y + 1);
+
+        uint32_t water_color;
+
+        if (depth < 0.35f) {
+            water_color = WATER_TOP;
+        } else if (depth < 0.70f) {
+            water_color = WATER_MID;
+        } else {
+            water_color = WATER_BOTTOM;
+        }
+
+        for (int x = left; x <= right; x++) {
+
+            float wave =
+                1.5f * sinf(
+                    (float)x * 0.12f +
+                    chip->wave_phase
+                );
+
+            int adjusted_surface =
+                surface_y + (int)wave;
+
+            if (y >= adjusted_surface) {
+                draw_pixel(x, y, water_color);
+            }
+        }
+    }
+
+    // Water surface highlight
+    for (int x = left; x <= right; x++) {
+
+        float wave =
+            1.5f * sinf(
+                (float)x * 0.12f +
+                chip->wave_phase
+            );
+
+        int y = surface_y + (int)wave;
+
+        draw_pixel(x, y, WATER_HIGHLIGHT);
+    }
+
+    // Reflection
+    if (percentage > 0.20f) {
+
+        int reflection_y =
+            surface_y +
+            (int)((bottom - surface_y) * 0.35f);
+
+        draw_line(
+            48, reflection_y,
+            85, reflection_y,
+            COLOR(130, 220, 255, 255)
+        );
+    }
+}
+
+// ============================================================
+// WATER LEVEL SCALE
+// ============================================================
+
+static void draw_level_scale(void) {
+
+    const int positions[5] = {
+        77, 101, 125, 149, 172
+    };
+
+    const char *labels[5] = {
+        "100", "75", "50", "25", "0"
+    };
+
+    for (int i = 0; i < 5; i++) {
+
+        int y = positions[i];
+
+        draw_line(
+            132, y,
+            138, y,
+            FRAME_LIGHT
+        );
+
+        draw_text_scaled(
+            140, y - 2,
+            labels[i],
+            GREY,
+            1
+        );
+    }
+}
+
+// ============================================================
+// STATUS INDICATORS
+// ============================================================
+
+static void draw_status(chip_state_t *chip) {
+
+    bool irrigation =
+        pin_read(chip->irrigation_pin);
+
+    bool refill =
+        pin_read(chip->refill_pin);
+
+    draw_rect(
+        8, 196, 76, 216,
+        PANEL_COLOR
+    );
+
+    draw_rect(
+        83, 196, 151, 216,
+        PANEL_COLOR
+    );
+
+    draw_rect(
+        13, 202, 20, 209,
+        irrigation ? GREEN : RED
+    );
+
+    draw_rect(
+        88, 202, 95, 209,
+        refill ? GREEN : RED
+    );
+
+    draw_text_scaled(
+        23, 203,
+        irrigation ? "IRR ON" : "IRR OFF",
+        WHITE,
+        1
+    );
+
+    draw_text_scaled(
+        98, 203,
+        refill ? "REF ON" : "REF OFF",
+        WHITE,
+        1
+    );
+}
+
+// ============================================================
+// COMPLETE DISPLAY RENDERING
+// ============================================================
+
+static void draw_reservoir(chip_state_t *chip) {
+
+    // Calculate scaling factors.
+    scale_x_factor =
+        (float)chip->width / BASE_WIDTH;
+
+    scale_y_factor =
+        (float)chip->height / BASE_HEIGHT;
+
+    render_width = chip->width;
+    render_height = chip->height;
+
+    // Clear display.
+    draw_rect(
+        0, 0,
+        BASE_WIDTH - 1,
+        BASE_HEIGHT - 1,
+        BG_COLOR
+    );
+
+    // Draw all elements.
+    draw_header(chip);
+
+    draw_tank_frame();
+
+    draw_water(chip);
+
+    // Draw tank edges over water.
+    draw_line(24, 70, 127, 70, FRAME_LIGHT);
+    draw_line(24, 70, 24, 178, FRAME_LIGHT);
+    draw_line(128, 71, 128, 178, FRAME_DARK);
+    draw_line(24, 179, 128, 179, FRAME_DARK);
+
+    draw_level_scale();
+
+    draw_status(chip);
+
+    // Update framebuffer.
+    buffer_write(
+        chip->framebuffer,
+        0,
+        pixels,
+        render_width * render_height * sizeof(uint32_t)
+    );
+}
+
+// ============================================================
+// RESERVOIR SIMULATION
+// ============================================================
+
+static void update_reservoir(chip_state_t *chip) {
+
+    uint64_t current_time = get_sim_nanos();
+
+    float elapsed_seconds =
+        (float)(current_time - chip->last_update) /
+        1000000000.0f;
+
+    chip->last_update = current_time;
+
+    bool irrigation =
+        pin_read(chip->irrigation_pin);
+
+    bool refill =
+        pin_read(chip->refill_pin);
+
+    float inflow = 0.0f;
+    float outflow = 0.0f;
+
+    if (refill) {
+        inflow = REFILL_RATE;
+    }
+
+    if (irrigation) {
+        outflow = IRRIGATION_RATE;
+    }
+
+    // Convert L/min to L/s.
+    float net_flow =
+        (inflow - outflow) / 60.0f;
+
+    chip->volume +=
+        net_flow * elapsed_seconds;
+
+    // Enforce tank limits.
+    if (chip->volume > TANK_CAPACITY) {
+        chip->volume = TANK_CAPACITY;
+    }
+
+    if (chip->volume < 0.0f) {
+        chip->volume = 0.0f;
+    }
+
+    // Animate water.
+    chip->wave_phase += 0.08f;
+
+    if (chip->wave_phase > 6.28318f) {
+        chip->wave_phase -= 6.28318f;
+    }
+
+    // Convert volume percentage to voltage.
+    float level_percentage =
+        chip->volume / TANK_CAPACITY;
+
+    float output_voltage =
+        level_percentage * LEVEL_MAX_VOLTAGE;
+
+    pin_dac_write(
+        chip->level_pin,
+        output_voltage
+    );
+
+    draw_reservoir(chip);
+}
+
+// ============================================================
+// TIMER CALLBACK
+// ============================================================
+
+static void timer_callback(void *user_data) {
+
+    chip_state_t *chip =
+        (chip_state_t *)user_data;
+
+    update_reservoir(chip);
+}
+
+// ============================================================
+// CHIP INITIALIZATION
+// ============================================================
+
+void chip_init(void) {
+
+    chip_state_t *chip =
+        (chip_state_t *)malloc(sizeof(chip_state_t));
+
+    if (!chip) {
+        return;
+    }
+
+    // Initialize pins.
+    chip->irrigation_pin =
+        pin_init("IRRIGATION", INPUT_PULLDOWN);
+
+    chip->refill_pin =
+        pin_init("REFILL", INPUT_PULLDOWN);
+
+    chip->level_pin =
+        pin_init("LEVEL", ANALOG);
+
+    // Initialize reservoir state.
+    chip->volume = INITIAL_VOLUME;
+
+    chip->wave_phase = 0.0f;
+
+    chip->last_update = get_sim_nanos();
+
+    // Set display dimensions.
+    chip->width = DISPLAY_WIDTH;
+    chip->height = DISPLAY_HEIGHT;
+
+    // Initialize framebuffer.
+    chip->framebuffer =
+        framebuffer_init(
+            &chip->width,
+            &chip->height
+        );
+
+    // Ensure framebuffer dimensions fit allocation.
+    if (chip->width > MAX_DISPLAY_WIDTH ||
+        chip->height > MAX_DISPLAY_HEIGHT) {
+        free(chip);
+        return;
+    }
+
+    // Draw initial display.
+    draw_reservoir(chip);
+
+    // Initialize timer.
+    const timer_config_t timer_config = {
+        .callback = timer_callback,
+        .user_data = chip,
+    };
+
+    chip->timer = timer_init(&timer_config);
+
+    timer_start(
+        chip->timer,
+        UPDATE_INTERVAL_US,
+        true
+    );
+}
